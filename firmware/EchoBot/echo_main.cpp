@@ -87,6 +87,20 @@ Note seq[24]; int seqLen = 0, seqPos = 0; unsigned long seqNext = 0; bool pianoT
 
 // wifi station (hotspot link)
 String staSsid = "", staPass = "";
+// hotspot link: try for 20 s, then stop searching (searching makes the phone drop off Echo-Bot)
+unsigned long staStart = 0, staRetryAt = 0; bool staTrying = false, staLinked = false;
+void staBegin() {
+  if (!staSsid.length()) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(staSsid.c_str(), staPass.c_str());
+  staStart = millis(); staTrying = true;
+}
+void staStop() {
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_AP);
+  staTrying = false;
+  staRetryAt = millis() + 10UL * 60UL * 1000UL;   // try again in 10 minutes
+}
 
 void drawFrame();
 bool passed[2] = {false, false};
@@ -637,7 +651,7 @@ void setupWeb() {
   server.on("/api/wifi", []() {
     staSsid = server.arg("ssid"); staPass = server.arg("pass");
     prefs.putString("ssid", staSsid); prefs.putString("pass", staPass);
-    if (staSsid.length()) WiFi.begin(staSsid.c_str(), staPass.c_str()); else WiFi.disconnect();
+    if (staSsid.length()) staBegin(); else { staStop(); staRetryAt = 0; }
     sendJson(statusJson());
   });
   server.on("/api/sleep", []() { lastActivity = 0; sleeping = true; oled.dim(true); PLAY(SND_SLEEP); sendJson(statusJson()); });
@@ -680,8 +694,10 @@ void setup() {
 #endif
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);                         // steadier access point
   WiFi.softAP(ECHO_WIFI_NAME, ECHO_WIFI_PASS);
-  if (staSsid.length()) WiFi.begin(staSsid.c_str(), staPass.c_str());
+  WiFi.setTxPower(WIFI_POWER_15dBm);            // less current spike on battery
+  if (staSsid.length()) staBegin(); else WiFi.mode(WIFI_AP);
   dns.start(53, "*", WiFi.softAPIP());
   setupWeb();
 
@@ -692,7 +708,24 @@ void setup() {
   setMood(HAPPY, 4000); PLAY(SND_HI);
 }
 
+void wifiLoop() {
+  if (!staSsid.length()) return;
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up && !staLinked) {
+    staLinked = true; staTrying = false;
+    Serial.printf("Linked to %s, my address: http://%s\n", staSsid.c_str(), WiFi.localIP().toString().c_str());
+    showMsg("Linked! " + WiFi.localIP().toString(), 8000);
+  }
+  if (!up && staLinked) { staLinked = false; staBegin(); }
+  if (staTrying && !up && millis() - staStart > 20000) {
+    Serial.println("Hotspot not found - stopped searching (retry in 10 min)");
+    staStop();
+  }
+  if (!staTrying && !up && staRetryAt && millis() > staRetryAt) staBegin();
+}
+
 void loop() {
+  wifiLoop();
   dns.processNextRequest();
   server.handleClient();
   touchLoop();
